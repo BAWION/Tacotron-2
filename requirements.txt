@@ -2,7 +2,7 @@ numpy==1.19.5
 scipy==1.5.4
 tensorflow==2.6.0
 cython
-portaudio
+pyaudio
 h5py
 falcon==1.2.0
 inflect==0.2.5
