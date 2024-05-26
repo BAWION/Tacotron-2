@@ -1,110 +1,166 @@
-import argparse
 import os
-from multiprocessing import cpu_count
-
-from datasets import preprocessor
-from hparams import hparams
+from concurrent.futures import ProcessPoolExecutor
+from functools import partial
+import numpy as np
 from tqdm import tqdm
+from datasets import audio
 
+def is_mulaw_quantize(input_type):
+    return input_type == 'mulaw-quantize'
 
-def preprocess(args, input_folders, out_dir, hparams):
-	mel_dir = os.path.join(out_dir, 'mels')
-	wav_dir = os.path.join(out_dir, 'audio')
-	linear_dir = os.path.join(out_dir, 'linear')
-	os.makedirs(mel_dir, exist_ok=True)
-	os.makedirs(wav_dir, exist_ok=True)
-	os.makedirs(linear_dir, exist_ok=True)
-	metadata = preprocessor.build_from_path(hparams, input_folders, mel_dir, linear_dir, wav_dir, args.n_jobs, tqdm=tqdm)
-	write_metadata(metadata, out_dir)
+def is_mulaw(input_type):
+    return input_type == 'mulaw'
 
-def write_metadata(metadata, out_dir):
-	with open(os.path.join(out_dir, 'train.txt'), 'w', encoding='utf-8') as f:
-		for m in metadata:
-			f.write('|'.join([str(x) for x in m]) + '\n')
-	mel_frames = sum([int(m[4]) for m in metadata])
-	timesteps = sum([int(m[3]) for m in metadata])
-	sr = hparams.sample_rate
-	hours = timesteps / sr / 3600
-	print('Write {} utterances, {} mel frames, {} audio timesteps, ({:.2f} hours)'.format(
-		len(metadata), mel_frames, timesteps, hours))
-	print('Max input length (text chars): {}'.format(max(len(m[5]) for m in metadata)))
-	print('Max mel frames length: {}'.format(max(int(m[4]) for m in metadata)))
-	print('Max audio timesteps length: {}'.format(max(m[3] for m in metadata)))
+def mulaw(x, quantize_channels):
+    mu = quantize_channels - 1
+    safe_x = np.minimum(np.abs(x), 1.0)
+    f = np.sign(x) * np.log1p(mu * safe_x) / np.log1p(mu)
+    return f
 
-def norm_data(args):
+def mulaw_quantize(x, quantize_channels):
+    mu = quantize_channels - 1
+    y = mulaw(x, quantize_channels)
+    return ((y + 1) / 2 * mu + 0.5).astype(np.int)
 
-	merge_books = (args.merge_books=='True')
+def build_from_path(hparams, input_dirs, mel_dir, linear_dir, wav_dir, n_jobs=12, tqdm=lambda x: x):
+    # We use ProcessPoolExecutor to parallelize across processes, this is just for
+    # optimization purposes and it can be omitted
+    executor = ProcessPoolExecutor(max_workers=n_jobs)
+    futures = []
+    index = 1
+    for input_dir in input_dirs:
+        with open(os.path.join(input_dir, 'metadata.csv'), encoding='utf-8') as f:
+            for line in f:
+                parts = line.strip().split('|')
+                print("Debug: parts =", parts)
+                if len(parts) < 3:
+                    print("Skipping line:", line)
+                    continue
+                basename = parts[0]
+                wav_path = os.path.join(input_dir, 'wavs', '{}'.format(basename))
+                print(f"Debug: Checking if file exists: {wav_path}")
+                if not os.path.exists(wav_path):
+                    print(f"File {wav_path} does not exist, skipping!")
+                    continue
+                text = parts[2]
+                futures.append(executor.submit(partial(_process_utterance, mel_dir, linear_dir, wav_dir, basename, wav_path, text, hparams)))
+                index += 1
 
-	print('Selecting data folders..')
-	supported_datasets = ['LJSpeech-1.0', 'LJSpeech-1.1', 'M-AILABS']
-	if args.dataset not in supported_datasets:
-		raise ValueError('dataset value entered {} does not belong to supported datasets: {}'.format(
-			args.dataset, supported_datasets))
+    return [future.result() for future in tqdm(futures) if future.result() is not None]
 
-	if args.dataset.startswith('LJSpeech'):
-		return [os.path.join(args.base_dir, args.dataset)]
+def _process_utterance(mel_dir, linear_dir, wav_dir, index, wav_path, text, hparams):
+    """
+    Preprocesses a single utterance wav/text pair
 
+    This writes the mel scale spectrogram to disk and returns a tuple to write
+    to the train.txt file
 
-	if args.dataset == 'M-AILABS':
-		supported_languages = ['en_US', 'en_UK', 'fr_FR', 'it_IT', 'de_DE', 'es_ES', 'ru_RU',
-			'uk_UK', 'pl_PL', 'nl_NL', 'pt_PT', 'fi_FI', 'se_SE', 'tr_TR', 'ar_SA']
-		if args.language not in supported_languages:
-			raise ValueError('Please enter a supported language to use from M-AILABS dataset! \n{}'.format(
-				supported_languages))
+    Args:
+        - mel_dir: the directory to write the mel spectrograms into
+        - linear_dir: the directory to write the linear spectrograms into
+        - wav_dir: the directory to write the preprocessed wav into
+        - index: the numeric index to use in the spectrogram filename
+        - wav_path: path to the audio file containing the speech input
+        - text: text spoken in the input audio file
+        - hparams: hyper parameters
 
-		supported_voices = ['female', 'male', 'mix']
-		if args.voice not in supported_voices:
-			raise ValueError('Please enter a supported voice option to use from M-AILABS dataset! \n{}'.format(
-				supported_voices))
+    Returns:
+        - A tuple: (audio_filename, mel_filename, linear_filename, time_steps, mel_frames, text)
+    """
+    try:
+        # Load the audio as numpy array
+        wav = audio.load_wav(wav_path, sr=hparams.sample_rate)
+    except FileNotFoundError:  # catch missing wav exception
+        print('file {} present in csv metadata is not present in wav folder. skipping!'.format(wav_path))
+        return None
 
-		path = os.path.join(args.base_dir, args.language, 'by_book', args.voice)
-		supported_readers = [e for e in os.listdir(path) if os.path.isdir(os.path.join(path,e))]
-		if args.reader not in supported_readers:
-			raise ValueError('Please enter a valid reader for your language and voice settings! \n{}'.format(
-				supported_readers))
+    # Trim lead/trail silences
+    if hparams.trim_silence:
+        wav = audio.trim_silence(wav, hparams)
 
-		path = os.path.join(path, args.reader)
-		supported_books = [e for e in os.listdir(path) if os.path.isdir(os.path.join(path,e))]
-		if merge_books:
-			return [os.path.join(path, book) for book in supported_books]
+    # Pre-emphasize
+    preem_wav = audio.preemphasis(wav, hparams.preemphasis, hparams.preemphasize)
 
-		else:
-			if args.book not in supported_books:
-				raise ValueError('Please enter a valid book for your reader settings! \n{}'.format(
-					supported_books))
+    # Rescale wav
+    if hparams.rescale:
+        wav = wav / np.abs(wav).max() * hparams.rescaling_max
+        preem_wav = preem_wav / np.abs(preem_wav).max() * hparams.rescaling_max
 
-			return [os.path.join(path, args.book)]
+        # Assert all audio is in [-1, 1]
+        if (wav > 1.).any() or (wav < -1.).any():
+            raise RuntimeError('wav has invalid value: {}'.format(wav_path))
+        if (preem_wav > 1.).any() or (preem_wav < -1.).any():
+            raise RuntimeError('wav has invalid value: {}'.format(wav_path))
 
+    # Mu-law quantize
+    if is_mulaw_quantize(hparams.input_type):
+        # [0, quantize_channels)
+        out = mulaw_quantize(wav, hparams.quantize_channels)
 
-def run_preprocess(args, hparams):
-	input_folders = norm_data(args)
-	output_folder = os.path.join(args.base_dir, args.output)
+        # Trim silences
+        start, end = audio.start_and_end_indices(out, hparams.silence_threshold)
+        wav = wav[start: end]
+        preem_wav = preem_wav[start: end]
+        out = out[start: end]
 
-	preprocess(args, input_folders, output_folder, hparams)
+        constant_values = mulaw_quantize(0, hparams.quantize_channels)
+        out_dtype = np.int16
 
+    elif is_mulaw(hparams.input_type):  # [-1, 1]
+        out = mulaw(wav, hparams.quantize_channels)
+        constant_values = mulaw(0., hparams.quantize_channels)
+        out_dtype = np.float32
 
-def main():
-	print('initializing preprocessing..')
-	parser = argparse.ArgumentParser()
-	parser.add_argument('--base_dir', default='')
-	parser.add_argument('--hparams', default='',
-		help='Hyperparameter overrides as a comma-separated list of name=value pairs')
-	parser.add_argument('--dataset', default='LJSpeech-1.1')
-	parser.add_argument('--language', default='en_US')
-	parser.add_argument('--voice', default='female')
-	parser.add_argument('--reader', default='mary_ann')
-	parser.add_argument('--merge_books', default='False')
-	parser.add_argument('--book', default='northandsouth')
-	parser.add_argument('--output', default='training_data')
-	parser.add_argument('--n_jobs', type=int, default=cpu_count())
-	args = parser.parse_args()
+    else:
+        # [-1, 1]
+        out = wav
+        constant_values = 0.
+        out_dtype = np.float32
 
-	modified_hp = hparams.parse(args.hparams)
+    # Compute the mel scale spectrogram from the wav
+    mel_spectrogram = audio.melspectrogram(preem_wav, hparams).astype(np.float32)
+    mel_frames = mel_spectrogram.shape[1]
 
-	assert args.merge_books in ('False', 'True')
+    if mel_frames > hparams.max_mel_frames and hparams.clip_mels_length:
+        return None
 
-	run_preprocess(args, modified_hp)
+    # Compute the linear scale spectrogram from the wav
+    linear_spectrogram = audio.linearspectrogram(preem_wav, hparams).astype(np.float32)
+    linear_frames = linear_spectrogram.shape[1]
 
+    # Sanity check
+    assert linear_frames == mel_frames
 
-if __name__ == '__main__':
-	main()
+    if hparams.use_lws:
+        # Ensure time resolution adjustment between audio and mel-spectrogram
+        fft_size = hparams.n_fft if hparams.win_size is None else hparams.win_size
+        l, r = audio.pad_lr(wav, fft_size, audio.get_hop_size(hparams))
+
+        # Zero pad audio signal
+        out = np.pad(out, (l, r), mode='constant', constant_values=constant_values)
+    else:
+        # Ensure time resolution adjustment between audio and mel-spectrogram
+        l_pad, r_pad = audio.librosa_pad_lr(wav, hparams.n_fft, audio.get_hop_size(hparams), hparams.wavenet_pad_sides)
+
+        # Reflect pad audio signal on the right (Just like it's done in Librosa to avoid frame inconsistency)
+        out = np.pad(out, (l_pad, r_pad), mode='constant', constant_values=constant_values)
+
+    assert len(out) >= mel_frames * audio.get_hop_size(hparams)
+
+    # Time resolution adjustment
+    # Ensure length of raw audio is multiple of hop size so that we can use
+    # transposed convolution to upsample
+    out = out[:mel_frames * audio.get_hop_size(hparams)]
+    assert len(out) % audio.get_hop_size(hparams) == 0
+    time_steps = len(out)
+
+    # Write the spectrogram and audio to disk
+    audio_filename = 'audio-{}.npy'.format(index)
+    mel_filename = 'mel-{}.npy'.format(index)
+    linear_filename = 'linear-{}.npy'.format(index)
+    np.save(os.path.join(wav_dir, audio_filename), out.astype(out_dtype), allow_pickle=False)
+    np.save(os.path.join(mel_dir, mel_filename), mel_spectrogram.T, allow_pickle=False)
+    np.save(os.path.join(linear_dir, linear_filename), linear_spectrogram.T, allow_pickle=False)
+
+    # Return a tuple describing this training example
+    return (audio_filename, mel_filename, linear_filename, time_steps, mel_frames, text)
